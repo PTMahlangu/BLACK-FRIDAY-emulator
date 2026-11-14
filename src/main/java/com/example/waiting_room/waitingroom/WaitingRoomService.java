@@ -1,41 +1,35 @@
 package com.example.waiting_room.waitingroom;
 
+import com.example.waiting_room.config.BlackFridayProperties;
 import com.example.waiting_room.events.EventPublisher;
 import com.example.waiting_room.events.EventType;
 import com.example.waiting_room.events.ShopEvent;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * FIFO virtual waiting room. A scheduler admits shoppers at a fixed rate,
- * as long as the store is below capacity.
+ * Virtual waiting room. The line itself lives in Kafka ({@link KafkaWaitingQueue});
+ * this service keeps the ticket registry (status lookups), the store occupancy
+ * and the admission rate budget that the Kafka gatekeeper asks for on every tick.
  */
 @Service
-public class WaitingRoomService {
-
-    private static final long TICK_MS = 100;
+public class WaitingRoomService implements KafkaWaitingQueue.Gate {
 
     private final EventPublisher events;
+    private final KafkaWaitingQueue queue;
 
     private final Map<UUID, Ticket> tickets = new ConcurrentHashMap<>();
-    private final Queue<Ticket> queue = new ConcurrentLinkedQueue<>();
     private final Map<UUID, Ticket> inStore = new ConcurrentHashMap<>();
-
-    private final AtomicLong nextSequence = new AtomicLong();
-    private volatile long lastAdmittedSequence = 0;
     private final AtomicInteger waiting = new AtomicInteger();
 
     private final LongAdder joined = new LongAdder();
@@ -45,21 +39,33 @@ public class WaitingRoomService {
     private final LongAdder done = new LongAdder();
 
     private volatile WaitingRoomSettings settings;
-    private double admissionBudget = 0; // guarded by this (tick and reset are synchronized)
+    private volatile double admissionBudget = 0; // written by the gatekeeper thread (and reset)
 
-    public WaitingRoomService(EventPublisher events,
-                              @Value("${blackfriday.admission-rate-per-second:20}") double rate,
-                              @Value("${blackfriday.store-capacity:200}") int capacity,
-                              @Value("${blackfriday.session-seconds:30}") int sessionSeconds) {
+    public WaitingRoomService(EventPublisher events, KafkaWaitingQueue queue, BlackFridayProperties defaults) {
         this.events = events;
-        this.settings = new WaitingRoomSettings(rate, capacity, sessionSeconds);
+        this.queue = queue;
+        this.settings = new WaitingRoomSettings(
+                defaults.admissionRatePerSecond(), defaults.storeCapacity(), defaults.sessionSeconds());
     }
 
+    @EventListener(ApplicationReadyEvent.class)
+    void openWaitingRoom() {
+        queue.start(this);
+    }
+
+    /** Joins the back of the line. Blocks until Kafka has stored the ticket. */
     public Ticket join() {
-        Ticket ticket = new Ticket(nextSequence.incrementAndGet());
+        Ticket ticket = new Ticket();
+        // Register before producing so the gatekeeper always recognises the record.
         tickets.put(ticket.id(), ticket);
         waiting.incrementAndGet();
-        queue.add(ticket);
+        try {
+            ticket.assignOffset(queue.enqueue(ticket.id()));
+        } catch (RuntimeException e) {
+            tickets.remove(ticket.id());
+            waiting.decrementAndGet();
+            throw e;
+        }
         joined.increment();
         events.publish(ShopEvent.of(EventType.JOINED, ticket.id()));
         return ticket;
@@ -69,7 +75,7 @@ public class WaitingRoomService {
         return Optional.ofNullable(tickets.get(id));
     }
 
-    /** Shopper gives up while waiting. The ticket stays in the queue and is skipped on admission. */
+    /** Shopper gives up while waiting. The gatekeeper skips their record when it reaches it. */
     public void abandon(UUID id) {
         find(id).filter(t -> t.transition(TicketStatus.WAITING, TicketStatus.ABANDONED)).ifPresent(t -> {
             waiting.decrementAndGet();
@@ -91,44 +97,58 @@ public class WaitingRoomService {
         return find(id).map(t -> t.status() == TicketStatus.ADMITTED).orElse(false);
     }
 
-    /** Approximate number of people ahead of this ticket. */
+    /** Places in line counted by Kafka offsets: 1 means next to be admitted. Includes people who gave up but are not yet skipped. */
     public long position(Ticket ticket) {
         if (ticket.status() != TicketStatus.WAITING) {
             return 0;
         }
-        return Math.max(1, ticket.sequence() - lastAdmittedSequence);
+        long head = queue.headOffset();
+        if (ticket.offset() < 0 || head < 0) {
+            return waiting.get();
+        }
+        return Math.max(1, ticket.offset() - head + 1);
     }
 
     public long estimatedWaitSeconds(Ticket ticket) {
         return (long) Math.ceil(position(ticket) / settings.admissionRatePerSecond());
     }
 
-    @Scheduled(fixedRate = TICK_MS)
-    synchronized void tick() {
+    // ---- KafkaWaitingQueue.Gate, called by the gatekeeper thread every tick ----
+
+    @Override
+    public int allowance() {
         expireSessions();
-        admit();
+        WaitingRoomSettings s = settings;
+        admissionBudget = Math.min(admissionBudget + s.admissionRatePerSecond() * KafkaWaitingQueue.TICK_MS / 1000.0,
+                Math.max(1, s.admissionRatePerSecond()));
+        int freeSlots = s.storeCapacity() - inStore.size();
+        return (int) Math.max(0, Math.min(Math.floor(admissionBudget), freeSlots));
     }
 
-    private void admit() {
-        WaitingRoomSettings s = settings;
-        admissionBudget = Math.min(admissionBudget + s.admissionRatePerSecond() * TICK_MS / 1000.0,
-                Math.max(1, s.admissionRatePerSecond()));
-        while (admissionBudget >= 1 && inStore.size() < s.storeCapacity()) {
-            Ticket next = queue.poll();
-            if (next == null) {
-                admissionBudget = Math.min(admissionBudget, 1);
-                return;
-            }
-            if (next.transition(TicketStatus.WAITING, TicketStatus.ADMITTED)) {
-                waiting.decrementAndGet();
-                inStore.put(next.id(), next);
-                lastAdmittedSequence = next.sequence();
-                admitted.increment();
-                admissionBudget -= 1;
-                events.publish(ShopEvent.of(EventType.ADMITTED, next.id()));
-            }
-            // abandoned tickets are dropped without using budget
+    @Override
+    public boolean isWaiting(UUID ticketId) {
+        Ticket t = tickets.get(ticketId);
+        return t != null && t.status() == TicketStatus.WAITING;
+    }
+
+    @Override
+    public boolean admit(UUID ticketId) {
+        Ticket t = tickets.get(ticketId);
+        if (t == null || !t.transition(TicketStatus.WAITING, TicketStatus.ADMITTED)) {
+            return false;
         }
+        waiting.decrementAndGet();
+        inStore.put(t.id(), t);
+        admitted.increment();
+        admissionBudget -= 1;
+        events.publish(ShopEvent.of(EventType.ADMITTED, t.id()));
+        return true;
+    }
+
+    @Override
+    public void queueIdle() {
+        // don't let unused budget pile up into a burst when the next crowd arrives
+        admissionBudget = Math.min(admissionBudget, 1);
     }
 
     private void expireSessions() {
@@ -143,6 +163,8 @@ public class WaitingRoomService {
         }
     }
 
+    // ---- settings, reset, stats ----
+
     public WaitingRoomSettings settings() {
         return settings;
     }
@@ -151,13 +173,12 @@ public class WaitingRoomService {
         this.settings = newSettings;
     }
 
-    public synchronized void reset() {
-        queue.clear();
+    /** Clears all tickets and moves the Kafka line's head to its tail. */
+    public void reset() {
+        queue.requestReset();
         tickets.clear();
         inStore.clear();
         waiting.set(0);
-        nextSequence.set(0);
-        lastAdmittedSequence = 0;
         admissionBudget = 0;
         joined.reset();
         admitted.reset();
@@ -167,11 +188,18 @@ public class WaitingRoomService {
     }
 
     public Stats stats() {
+        long head = queue.headOffset();
+        long tail = queue.tailOffset();
         return new Stats(waiting.get(), inStore.size(), joined.sum(), admitted.sum(),
-                abandoned.sum(), expired.sum(), done.sum());
+                abandoned.sum(), expired.sum(), done.sum(),
+                new QueueOffsets(head, tail, head < 0 ? 0 : Math.max(0, tail - head)));
     }
 
     public record Stats(int waiting, int inStore, long joined, long admitted,
-                        long abandoned, long expired, long leftStore) {
+                        long abandoned, long expired, long leftStore, QueueOffsets kafkaQueue) {
+    }
+
+    /** head = next offset to admit, tail = next offset to be written, lag = records not yet handled. */
+    public record QueueOffsets(long head, long tail, long lag) {
     }
 }

@@ -1,8 +1,8 @@
 package com.example.waiting_room.simulation;
 
 import com.example.waiting_room.store.Product;
+import com.example.waiting_room.store.PurchaseResult;
 import com.example.waiting_room.store.StoreService;
-import com.example.waiting_room.store.StoreService.PurchaseResult;
 import com.example.waiting_room.waitingroom.Ticket;
 import com.example.waiting_room.waitingroom.TicketStatus;
 import com.example.waiting_room.waitingroom.WaitingRoomService;

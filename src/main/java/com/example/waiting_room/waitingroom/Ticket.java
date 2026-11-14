@@ -8,14 +8,11 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class Ticket {
 
     private final UUID id = UUID.randomUUID();
-    private final long sequence;
     private final Instant joinedAt = Instant.now();
     private final AtomicReference<TicketStatus> status = new AtomicReference<>(TicketStatus.WAITING);
     private volatile Instant admittedAt;
-
-    Ticket(long sequence) {
-        this.sequence = sequence;
-    }
+    /** Offset of this ticket's record in the Kafka queue topic, -1 until Kafka confirms it. */
+    private volatile long offset = -1;
 
     boolean transition(TicketStatus from, TicketStatus to) {
         boolean changed = status.compareAndSet(from, to);
@@ -25,12 +22,16 @@ public final class Ticket {
         return changed;
     }
 
+    void assignOffset(long offset) {
+        this.offset = offset;
+    }
+
     public UUID id() {
         return id;
     }
 
-    public long sequence() {
-        return sequence;
+    public long offset() {
+        return offset;
     }
 
     public Instant joinedAt() {

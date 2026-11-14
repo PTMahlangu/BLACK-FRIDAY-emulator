@@ -1,5 +1,6 @@
 package com.example.waiting_room.events;
 
+import com.example.waiting_room.config.KafkaTopics;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
@@ -22,7 +23,7 @@ public class EventStatsListener {
         }
     }
 
-    @KafkaListener(topics = EventPublisher.TOPIC)
+    @KafkaListener(topics = KafkaTopics.SHOP_EVENTS)
     public void onEvent(ConsumerRecord<String, String> record) {
         try {
             counts.get(EventType.valueOf(record.key())).increment();

@@ -147,6 +147,7 @@ function render(d) {
   const eta = d.settings.admissionRatePerSecond > 0 ? Math.ceil(w.waiting / d.settings.admissionRatePerSecond) : 0;
   const metrics = [
     ['In queue', w.waiting, `~${eta}s wait for the last in line`],
+    ['Kafka line', w.kafkaQueue.lag, `offsets ${w.kafkaQueue.head.toLocaleString()} → ${w.kafkaQueue.tail.toLocaleString()}`],
     ['In store', w.inStore, `capacity ${d.settings.storeCapacity}`],
     ['Joined', w.joined, ''],
     ['Admitted', w.admitted, ''],

@@ -16,8 +16,6 @@ import java.util.concurrent.atomic.LongAdder;
 @RequiredArgsConstructor
 public class StoreService {
 
-    public enum PurchaseResult { PURCHASED, SOLD_OUT, NOT_ADMITTED, UNKNOWN_PRODUCT }
-
     private final ProductRepository products;
     private final PurchaseOrderRepository orders;
     private final WaitingRoomService waitingRoom;
