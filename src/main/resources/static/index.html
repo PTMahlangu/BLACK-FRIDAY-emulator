@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Black Friday Emulator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0e0e10; --card:#18181c; --line:#2a2a30; --text:#eee; --muted:#999;
+          --accent:#ffcc00; --red:#ff4d4d; --green:#3ddc84; --blue:#4da3ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; }
+  header h1 { margin:0; font-size:22px; }
+  header h1 span { color:var(--accent); }
+  #status { padding:4px 10px; border-radius:12px; font-size:13px; background:#333; }
+  #status.on { background:var(--red); animation: pulse 1s infinite alternate; }
+  @keyframes pulse { to { opacity:.6; } }
+  main { padding:24px; display:grid; gap:16px; grid-template-columns: 340px 1fr; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:15px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  label { display:flex; justify-content:space-between; align-items:center; margin:8px 0; font-size:14px; }
+  input { width:110px; background:#0e0e10; border:1px solid var(--line); color:var(--text); padding:6px; border-radius:6px; }
+  button { cursor:pointer; border:0; border-radius:6px; padding:9px 14px; font-weight:600; margin:8px 6px 0 0; }
+  .go { background:var(--accent); color:#000; } .stop { background:var(--red); color:#fff; }
+  .plain { background:#333; color:var(--text); }
+  .metrics { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr)); gap:12px; }
+  .metric { background:#111114; border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .metric b { display:block; font-size:26px; margin-top:4px; }
+  .metric small { color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td, th { padding:8px 6px; border-bottom:1px solid var(--line); text-align:left; }
+  .bar { height:8px; background:#333; border-radius:4px; overflow:hidden; min-width:120px; }
+  .bar div { height:100%; background:var(--green); }
+  .soldout { color:var(--red); font-weight:700; }
+  canvas { width:100%; height:240px; }
+  .legend span { margin-right:14px; font-size:13px; }
+  #error { color:var(--red); font-size:13px; min-height:18px; }
+  .stack { display:flex; flex-direction:column; gap:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>BLACK FRIDAY</span> emulator</h1>
+  <div id="status">idle</div>
+</header>
+<main>
+  <div class="stack">
+    <div class="card">
+      <h2>Crowd</h2>
+      <label>Shoppers <input id="shoppers" type="number" value="5000" min="1" max="100000"></label>
+      <label>Ramp-up (s) <input id="rampUpSeconds" type="number" value="30" min="0"></label>
+      <label>Buy probability <input id="buyProbability" type="number" value="0.7" step="0.05" min="0" max="1"></label>
+      <label>Patience (s) <input id="patienceSeconds" type="number" value="90" min="1"></label>
+      <button class="go" onclick="start()">Open the doors</button>
+      <button class="stop" onclick="stop()">Stop</button>
+    </div>
+    <div class="card">
+      <h2>Waiting room</h2>
+      <label>Admit per second <input id="admissionRatePerSecond" type="number" step="1" min="1"></label>
+      <label>Store capacity <input id="storeCapacity" type="number" min="1"></label>
+      <label>Session (s) <input id="sessionSeconds" type="number" min="1"></label>
+      <button class="plain" onclick="applySettings()">Apply live</button>
+      <button class="plain" onclick="resetAll()">Reset &amp; restock</button>
+      <div id="error"></div>
+    </div>
+    <div class="card">
+      <h2>Kafka events consumed</h2>
+      <table id="kafka"></table>
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="card metrics" id="metrics"></div>
+    <div class="card">
+      <h2>Live traffic (last 5 min)</h2>
+      <div class="legend">
+        <span style="color:var(--accent)">■ waiting</span>
+        <span style="color:var(--blue)">■ in store</span>
+        <span style="color:var(--green)">■ orders/s ×10</span>
+      </div>
+      <canvas id="chart" width="1000" height="240"></canvas>
+    </div>
+    <div class="card">
+      <h2>Deals</h2>
+      <table id="products"></table>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let settingsLoaded = false;
+
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method, headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    let msg = res.status + ' ' + res.statusText;
+    try { const p = await res.json(); msg = p.detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return res.status === 204 ? null : res.json().catch(() => null);
+}
+
+function num(id) { return Number($(id).value); }
+function showError(e) { $('error').textContent = e ? e.message : ''; }
+
+async function start() {
+  try {
+    showError();
+    await api('POST', '/api/simulation', {
+      shoppers: num('shoppers'), rampUpSeconds: num('rampUpSeconds'),
+      buyProbability: num('buyProbability'), patienceSeconds: num('patienceSeconds')
+    });
+  } catch (e) { showError(e); }
+}
+async function stop() { try { await api('DELETE', '/api/simulation'); } catch (e) { showError(e); } }
+async function resetAll() { try { showError(); await api('POST', '/api/reset'); } catch (e) { showError(e); } }
+async function applySettings() {
+  try {
+    showError();
+    await api('PUT', '/api/settings', {
+      admissionRatePerSecond: num('admissionRatePerSecond'),
+      storeCapacity: num('storeCapacity'), sessionSeconds: num('sessionSeconds')
+    });
+  } catch (e) { showError(e); }
+}
+
+const randFormat = new Intl.NumberFormat('en-ZA', { style: 'currency', currency: 'ZAR' });
+const money = cents => randFormat.format(cents / 100);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+function render(d) {
+  const w = d.waitingRoom, s = d.store;
+  $('status').textContent = d.simulation.running ? `LIVE · ${d.simulation.shoppersActive} shoppers active` : 'idle';
+  $('status').className = d.simulation.running ? 'on' : '';
+
+  if (!settingsLoaded) {
+    $('admissionRatePerSecond').value = d.settings.admissionRatePerSecond;
+    $('storeCapacity').value = d.settings.storeCapacity;
+    $('sessionSeconds').value = d.settings.sessionSeconds;
+    settingsLoaded = true;
+  }
+
+  const eta = d.settings.admissionRatePerSecond > 0 ? Math.ceil(w.waiting / d.settings.admissionRatePerSecond) : 0;
+  const metrics = [
+    ['In queue', w.waiting, `~${eta}s wait for the last in line`],
+    ['In store', w.inStore, `capacity ${d.settings.storeCapacity}`],
+    ['Joined', w.joined, ''],
+    ['Admitted', w.admitted, ''],
+    ['Gave up', w.abandoned, 'ran out of patience'],
+    ['Timed out', w.expired, 'session expired'],
+    ['Orders', s.purchased, ''],
+    ['Sold-out hits', s.soldOutRejections, 'wanted it, too late'],
+    ['Revenue', money(s.revenueCents), ''],
+  ];
+  $('metrics').innerHTML = metrics.map(([k, v, sub]) =>
+    `<div class="metric"><small>${k}</small><b>${typeof v === 'number' ? v.toLocaleString() : v}</b><small>${sub}</small></div>`).join('');
+
+  $('products').innerHTML = '<tr><th>Product</th><th>Price</th><th>Stock</th><th></th></tr>' +
+    d.products.map(p => {
+      const pct = p.initialStock ? (100 * p.stock / p.initialStock) : 0;
+      const stock = p.stock === 0 ? '<span class="soldout">SOLD OUT</span>' : `${p.stock} / ${p.initialStock}`;
+      return `<tr><td>${esc(p.name)}</td><td>${money(p.priceCents)}</td><td>${stock}</td>
+              <td><div class="bar"><div style="width:${pct}%"></div></div></td></tr>`;
+    }).join('');
+
+  $('kafka').innerHTML = Object.entries(d.kafka.byType).map(([k, v]) =>
+    `<tr><td>${k}</td><td>${v.toLocaleString()}</td></tr>`).join('') +
+    `<tr><th>Total</th><th>${d.kafka.consumed.toLocaleString()}</th></tr>`;
+
+  drawChart(d.history);
+}
+
+function drawChart(points) {
+  const c = $('chart'), g = c.getContext('2d');
+  const W = c.width, H = c.height, pad = 30;
+  g.clearRect(0, 0, W, H);
+  g.strokeStyle = '#2a2a30'; g.fillStyle = '#999'; g.font = '11px system-ui';
+  if (points.length < 2) { g.fillText('waiting for data…', pad, H / 2); return; }
+
+  const series = [
+    { key: p => p.waiting, color: '#ffcc00' },
+    { key: p => p.inStore, color: '#4da3ff' },
+    { key: p => p.ordersPerSec * 10, color: '#3ddc84' },
+  ];
+  const max = Math.max(10, ...points.flatMap(p => series.map(s => s.key(p))));
+  for (let i = 0; i <= 4; i++) {
+    const y = pad + (H - 2 * pad) * i / 4;
+    g.beginPath(); g.moveTo(pad, y); g.lineTo(W - 5, y); g.stroke();
+    g.fillText(Math.round(max * (1 - i / 4)).toLocaleString(), 2, y - 2);
+  }
+  const x = i => pad + (W - pad - 5) * i / (points.length - 1);
+  const y = v => H - pad - (H - 2 * pad) * v / max;
+  for (const s of series) {
+    g.strokeStyle = s.color; g.lineWidth = 2; g.beginPath();
+    points.forEach((p, i) => i ? g.lineTo(x(i), y(s.key(p))) : g.moveTo(x(i), y(s.key(p))));
+    g.stroke();
+  }
+  g.lineWidth = 1;
+}
+
+async function poll() {
+  try { render(await api('GET', '/api/stats')); } catch (e) { $('status').textContent = 'server unreachable'; }
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>
